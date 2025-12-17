@@ -2,26 +2,32 @@ import os
 import uuid
 import asyncio
 import requests
-import psycopg2 # O banco de dados profissional
+import psycopg2
 from flask import Flask, request, url_for, render_template
 from twilio.twiml.messaging_response import MessagingResponse
 from groq import Groq
 import edge_tts
 
+# --- NOVO: CARREGAR O .ENV (Para funcionar no seu Mac) ---
+from dotenv import load_dotenv
+load_dotenv() 
+# ---------------------------------------------------------
+
 app = Flask(__name__)
 
-# ================= SEGURANCA E CONFIGURACAO =================
-# Agora o codigo busca as chaves nas variaveis de ambiente da nuvem
+# ================= CONFIGURAÇÃO E SEGURANÇA =================
+# Pega as chaves do arquivo .env (local) ou das Variáveis do Railway (nuvem)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TWILIO_SID = os.environ.get("TWILIO_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL") 
 
-# Se nao tiver chaves (erro comum ao rodar local sem configurar), avisa
-if not GROQ_API_KEY:
-    print("⚠️ AVISO: Chaves de API nao encontradas. Configure as variaveis de ambiente.")
-
-client = Groq(api_key=GROQ_API_KEY)
+# Inicializa o cliente da Groq apenas se a chave existir
+if GROQ_API_KEY:
+    client = Groq(api_key=GROQ_API_KEY)
+else:
+    print("⚠️ AVISO: GROQ_API_KEY não encontrada.")
+    client = None
 
 SYSTEM_PROMPT = """
 You are an English teacher. 
@@ -31,19 +37,28 @@ You are an English teacher.
 4. Remember the context of the conversation.
 """
 
-# --- FUNCOES DO BANCO DE DADOS (POSTGRESQL) ---
+# --- FUNÇÕES DO BANCO DE DADOS (POSTGRESQL) ---
 
 def get_db_connection():
-    """Conecta ao PostgreSQL usando a URL da nuvem"""
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+    """Conecta ao PostgreSQL"""
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"⚠️ Erro de conexão com banco: {e}")
+        return None
 
 def init_db():
-    """Cria a tabela se ela nao existir (Versao Postgres)"""
+    """Cria a tabela se ela não existir"""
+    conn = get_db_connection()
+    if not conn:
+        print("⚠️ Rodando sem banco de dados (Modo Sem Memória)")
+        return
+
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
-        # SERIAL = Auto Incremento no Postgres
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS conversas (
                 id SERIAL PRIMARY KEY, 
@@ -55,26 +70,30 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
-        print("✅ Banco de Dados conectado e verificado!")
+        print("✅ Banco de Dados conectado!")
     except Exception as e:
-        print(f"⚠️ Erro ao conectar no Banco (Isso e normal se rodar local sem configurar): {e}")
+        print(f"Erro ao iniciar banco: {e}")
 
 def salvar_mensagem(user_id, role, content):
+    conn = get_db_connection()
+    if not conn: return # Se não tem banco, só ignora
+
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
-        # No Postgres usa-se %s em vez de ?
         cursor.execute('INSERT INTO conversas (user_id, role, content) VALUES (%s, %s, %s)', 
                       (user_id, role, content))
         conn.commit()
         cursor.close()
         conn.close()
     except Exception as e:
-        print(f"Erro ao salvar mensagem: {e}")
+        print(f"Erro ao salvar: {e}")
 
 def recuperar_historico(user_id):
+    conn = get_db_connection()
+    # Se não tem banco, retorna só o prompt do sistema
+    if not conn: return [{"role": "system", "content": SYSTEM_PROMPT}]
+
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         # Pega as ultimas 10 mensagens
         cursor.execute('''
@@ -89,6 +108,7 @@ def recuperar_historico(user_id):
         cursor.close()
         conn.close()
         
+        # Inverte para ficar na ordem cronológica (antigo -> novo)
         rows.reverse() 
         
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -97,12 +117,14 @@ def recuperar_historico(user_id):
             
         return messages
     except Exception as e:
-        print(f"Erro ao ler banco: {e}")
+        print(f"Erro ao ler histórico: {e}")
         return [{"role": "system", "content": SYSTEM_PROMPT}]
 
 def limpar_memoria(user_id):
+    conn = get_db_connection()
+    if not conn: return
+
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('DELETE FROM conversas WHERE user_id = %s', (user_id,))
         conn.commit()
@@ -111,27 +133,32 @@ def limpar_memoria(user_id):
     except Exception as e:
         print(f"Erro ao limpar: {e}")
 
-# Tenta iniciar o banco ao ligar (so funciona se tiver DATABASE_URL)
-if DATABASE_URL:
-    init_db()
+# Tenta iniciar o banco ao ligar o app
+init_db()
 
-# --- ROTA DA PAGINA INICIAL (AMIGAVEL) ---
+# --- ROTA PRINCIPAL (SITE AMIGÁVEL) ---
 @app.route("/")
 def home():
     return render_template("index.html")
 
-# --- FUNCOES DE AUDIO E IA ---
+# --- FUNÇÕES DE ÁUDIO E IA ---
 def transcrever_audio(url_audio_whatsapp, content_type):
+    if not client: return ""
     nome_arquivo = ""
     try:
+        # Detecção iPhone (.m4a) vs Android (.ogg)
         extensao = ".ogg"
         if "mp4" in content_type or "m4a" in content_type: extensao = ".m4a"
         elif "mp3" in content_type: extensao = ".mp3"
             
         nome_arquivo = f"entrada_{uuid.uuid4()}{extensao}"
+        
+        # Download autenticado do Twilio
         resposta = requests.get(url_audio_whatsapp, auth=(TWILIO_SID, TWILIO_TOKEN))
         
-        if resposta.status_code != 200: return ""
+        if resposta.status_code != 200: 
+            print("Erro download áudio")
+            return ""
 
         with open(nome_arquivo, 'wb') as f:
             f.write(resposta.content)
@@ -144,12 +171,14 @@ def transcrever_audio(url_audio_whatsapp, content_type):
             )
         return transcricao.text
     except Exception as e:
-        print(f"Erro transcricao: {e}")
+        print(f"Erro transcrição: {e}")
         return ""
     finally:
         if nome_arquivo and os.path.exists(nome_arquivo): os.remove(nome_arquivo)
 
 def chat_with_llama(user_id, user_input):
+    if not client: return "System Error: AI Key missing."
+    
     salvar_mensagem(user_id, "user", user_input)
     historico_completo = recuperar_historico(user_id)
     
@@ -161,8 +190,9 @@ def chat_with_llama(user_id, user_input):
         resposta = chat_completion.choices[0].message.content
         salvar_mensagem(user_id, "assistant", resposta)
         return resposta
-    except Exception:
-        return "Error calling AI."
+    except Exception as e:
+        print(f"Erro Groq: {e}")
+        return "I'm having trouble thinking right now."
 
 async def criar_audio_async(texto):
     nome_arquivo = f"resposta_{uuid.uuid4()}.mp3"
@@ -171,6 +201,7 @@ async def criar_audio_async(texto):
     await communicate.save(caminho_arquivo)
     return nome_arquivo
 
+# --- WEBHOOK (Onde o WhatsApp bate) ---
 @app.route("/bot", methods=['POST'])
 def bot():
     user_id = request.values.get('From')
@@ -189,6 +220,7 @@ def bot():
     msg = resp.message()
 
     if entrada_final:
+        # Comando secreto para limpar memória
         if entrada_final.lower() == "/reset":
             limpar_memoria(user_id)
             msg.body("Memory cleared!")
@@ -197,15 +229,18 @@ def bot():
         resposta_ia = chat_with_llama(user_id, entrada_final)
         msg.body(resposta_ia)
         
+        # Gera o áudio da resposta
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             nome_arquivo = loop.run_until_complete(criar_audio_async(resposta_ia))
             loop.close()
+            
+            # Cria link HTTPS para o WhatsApp tocar
             link_publico = url_for('static', filename=nome_arquivo, _external=True)
             msg.media(link_publico)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Erro TTS: {e}")
             
     else:
         msg.body("I couldn't hear you.")
